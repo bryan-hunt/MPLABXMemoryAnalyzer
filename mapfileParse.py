@@ -6,10 +6,12 @@ import csv
 import re
 import inspect
 import operator
-import pprint
+#import pprint
 import sys
 import time
 import argparse
+
+from tabulate import tabulate
 
 # -------------------------------------------------------------------------------------------
 # Globals to store common variables
@@ -160,7 +162,7 @@ def addrToFile(file, addrList):
     addrListChunks = [addrList[i:i + n] for i in range(0, len(addrList), n)]
 
     for addresses in addrListChunks:
-        command = f"xc32-addr2line.exe -e {file} {addresses}"
+        command = f'xc32-addr2line.exe -e {file} ' + ' '.join(addresses)
         process = subprocess.Popen(shlex.split(
             command, posix=False), stdout=subprocess.PIPE)
         retFileList += process.communicate()[0]
@@ -194,7 +196,9 @@ def attachFileNames(filename):
                 srcFileName = re.match(r'.*(?=:[\d]*|\?$)', srcFile.strip())
                 if srcFileName:
                     srcFile = srcFileName.group()
-                section[6] = srcFile
+                # Only keep the relative part
+                relIndex = srcFile.find('..')
+                section[6] = srcFile[relIndex if relIndex > 0 else 0:]
             if section[0] not in ['.vectors', '.gnu.attributes']:
                 writer.writerow(section)
 
@@ -203,21 +207,23 @@ def attachFileNames(filename):
 # at DIE 0. Idea transpired while playing around with https://github.com/vppillai/dwex . But
 # not using pyelftools to avoid an external dep.
 
-
 def getDWfileName(fileName):
     global projectPath
     objPath = os.path.join(projectPath, fileName)
-    # Get the level 0 dWARF info from the obj file in _ext
-    command = f"xc32-readelf.exe  --debug-dump=info --dwarf-depth=1 {objPath}"
-    # parse the output to get DW_AT_name field to get teh matching file name
-    AT_NAME_re = re.compile(r'(.*DW_AT_name[ ]*: )(.*)')
-    process = subprocess.Popen(shlex.split(
-        command, posix=False), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout = process.communicate()[0]
-    if stdout:
-        m = AT_NAME_re.search(stdout.strip().decode('utf-8'))
-        if m:
-            return((m[2].strip()))
+    if fileName.endswith('.c'):
+        return
+    if os.path.exists(objPath):
+        # Get the level 0 dWARF info from the obj file in _ext
+        command = f"xc32-readelf.exe  --debug-dump=info --dwarf-depth=1 {objPath}"
+        # parse the output to get DW_AT_name field to get teh matching file name
+        AT_NAME_re = re.compile(r'(.*DW_AT_name[ ]*: )(.*)')
+        process = subprocess.Popen(shlex.split(
+            command, posix=False), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout = process.communicate()[0]
+        if stdout:
+            m = AT_NAME_re.search(stdout.strip().decode('utf-8'))
+            if m:
+                return((m[2].strip()))
 
 # -------------------------------------------------------------------------------------------
 # Finalize filenames to be used for module names. The lib name is used for module name in
@@ -250,11 +256,13 @@ def finalizeFileNames(fileName):
                 # 1. check if we know this file already
                 if fileName in dwFileList:
                     section[5] = dwFileList[fileName]
+                    section[6] = dwFileList[fileName]
                 else:
                     # fetch file name from the obj in _ext
                     objModule = getDWfileName(fileName)
                     if objModule:
                         section[5] = objModule
+                        section[6] = objModule
                         dwFileList[fileName] = objModule
                     else:
                         # if no obj in build, it is coming from some pre-built module
@@ -267,13 +275,14 @@ def filewiseSize(fileName):
     sizeFileName = os.path.splitext(fileName)[0]+"_fileSize.csv"
     textPattern = re.compile(r"^\.text\..*$")
     moduleWiseData = {}
+    moduleWiseDataHeader = ["file", "text", "rodata", "data", "bss"]
 
     with open(moduleFileName, 'r', newline='') as modules, open(sizeFileName, 'w', newline='') as sizeFile:
         moduleReader = csv.reader(modules, delimiter=",")
         sizeWriter = csv.writer(sizeFile, delimiter=",")
         next(modules)  # skip first line
         for moduleEntry in moduleReader:
-            section = moduleEntry[0]
+            section = moduleEntry[1]
             entrySize = int(moduleEntry[3])
             moduleFile = moduleEntry[5]
 
@@ -287,27 +296,28 @@ def filewiseSize(fileName):
                         "rodata": 0, "data": 0, "bss": 0, "text": 0}
                 moduleFile = "misc"
 
-            if section in [".rodata"]:
+            if section.startswith('.rodata'):
                 moduleWiseData[moduleFile]["rodata"] += entrySize
-            elif section in [".data", ".sdata"]:
+            elif section.startswith(('.data','.sdata')):
                 moduleWiseData[moduleFile]["data"] += entrySize
-            elif section in [".bss", ".sbss"]:
+            elif section.startswith(('.bss','.sbss')):
                 moduleWiseData[moduleFile]["bss"] += entrySize
-            elif (section in [".text"]) or textPattern.match(section):
+            elif section.startswith('.text'):
                 moduleWiseData[moduleFile]["text"] += entrySize
 
-        sizeWriter.writerow(["file", "text", "rodata", "data", "bss"])
+        sizeWriter.writerow(moduleWiseDataHeader)
         for fileEntry, size in moduleWiseData.items():
             sizeWriter.writerow(
                 [fileEntry, size["text"], size["rodata"], size["data"], size["bss"]])
 
-        # pprint.pprint(moduleWiseData)
+        #print('\n' + tabulate(moduleWiseData.values(), headers=moduleWiseDataHeader) + '\n')
 
 
 def summarizeComponents(fileName):
     sizeFileName = os.path.splitext(fileName)[0]+"_fileSize.csv"
     summaryFileName = os.path.splitext(fileName)[0]+"_summary.csv"
     componentWiseData = {}
+    componentWiseDataHeader = ["component", "text", "rodata", "data", "bss"]
 
     with open(sizeFileName, 'r', newline='') as sizeFile, open(summaryFileName, 'w', newline='') as summaryFile:
         next(sizeFile)  # skip Header
@@ -337,14 +347,23 @@ def summarizeComponents(fileName):
                 componentWiseData["others"]["data"] += int(sizeEntry[3])
                 componentWiseData["others"]["bss"] += int(sizeEntry[4])
 
-        summaryWriter.writerow(["component", "text", "rodata", "data", "bss"])
+        summaryWriter.writerow(componentWiseDataHeader)
         for fileEntry, size in componentWiseData.items():
             summaryWriter.writerow(
                 [fileEntry, size["text"], size["rodata"], size["data"], size["bss"]])
-        # pprint.pprint(componentWiseData)
+        
+        print('\n' + tabulate([(k, v['text'], v['rodata'], v['data'], v['bss']) for k, v in componentWiseData.items()], headers=componentWiseDataHeader) + '\n')
 
 # -------------------------------------------------------------------------------------------
 # Cleanup the map file by removing debug info comments etc.
+
+_re_debug_aranges = re.compile(r'^ \.debug_aranges$')
+
+_re_config_0 = re.compile(r'^[ ]*\.config_[A-Z0-9]{8}$')
+_re_config_1 = re.compile(r'^.*\_\_config_[A-Z0-9]{8}$')
+_re_config_2 = re.compile(r'^ \*\(\.config_[A-Z0-9]{8}\)$')
+_re_config_3 = re.compile(r'^config_[A-Z0-9]{8}  0x.*$')
+_re_config_4 = re.compile(r'^configsfrs_[A-Z0-9]{8} 0x.*$')
 
 
 def cleanupMapFile(fileName):
@@ -356,27 +375,35 @@ def cleanupMapFile(fileName):
 
     with open(fileName, "r") as mapFile, open(cleanFileName, "w") as cleanFile:
         for lineItem in mapFile:
+            #if (re.search(r"^ \.debug_ranges  .*$", lineItem)):
+            if lineItem.startswith(' .debug_ranges '):
+                continue
+            #if (re.search(r"^ \.mdebug.abi32  .*$", lineItem)):
+            if lineItem.startswith(' .mdebug.abi32 '):
+                continue
+            #if (re.search(r"[ ]*^ \.comment       .*$", lineItem)):
+            if lineItem.startswith(' .comment '):
+                continue
+            #if (re.search(r"^ \.debug_info    .*$", lineItem)):
+            if lineItem.startswith(' .debug_info '):
+                continue
+            #if (re.search(r"^ \.debug_abbrev  .*$", lineItem)):
+            if lineItem.startswith(' .debug_abbrev '):
+                continue
+            #if (re.search(r"^ \.debug_line  .*$", lineItem)):
+            if lineItem.startswith(' .debug_line '):
+                continue
+            #if (re.search(r"^ \.debug_frame  .*$", lineItem)):
+            if lineItem.startswith(' .debug_frame '):
+                continue
+            #if (re.search(r"^ \.debug_str  .*$", lineItem)):
+            if lineItem.startswith(' .debug_str '):
+                continue
+            #if (re.search(r"^ \.debug_loc  .*$", lineItem)):
+            if lineItem.startswith(' .debug_loc '):
+                continue
 
-            if (re.search(r"^ \.debug_ranges  .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.mdebug.abi32  .*$", lineItem)):
-                continue
-            if (re.search(r"[ ]*^ \.comment       .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.debug_info    .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.debug_abbrev  .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.debug_line  .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.debug_frame  .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.debug_str  .*$", lineItem)):
-                continue
-            if (re.search(r"^ \.debug_loc  .*$", lineItem)):
-                continue
-
-            if (re.search(r"^ \.debug_aranges$", lineItem)):  # This item comes in 2 lines
+            if (_re_debug_aranges.search(lineItem)):  # This item comes in 2 lines
                 debug_aranges_skipNext = True
                 continue
             if debug_aranges_skipNext:
@@ -391,24 +418,24 @@ def cleanupMapFile(fileName):
 #                continue
 
             # This item comes in 2 lines  (e.g. .config_BFC55F8C)
-            if (re.search(r"^[ ]*\.config_[A-Z0-9]{8}$", lineItem)):
+            if (_re_config_0.search(lineItem)):
                 config_skipNext = True
                 continue
             #e.g.                 0x00000000bfc55f8c                __config_BFC55F8C
-            if (re.search(r"^.*\_\_config_[A-Z0-9]{8}$", lineItem)):
+            if (_re_config_1.search(lineItem)):
                 continue
 
 
             if config_skipNext:
                 config_skipNext = False
                 continue
-            if (re.search(r"^ \*\(\.config_[A-Z0-9]{8}\)$", lineItem)):
+            if (_re_config_2.search(lineItem)):
                 continue
 
             # to remove config sections from memory configuration
-            if (re.search(r"^config_[A-Z0-9]{8}  0x.*$", lineItem)):
+            if (_re_config_3.search(lineItem)):
                 continue
-            if (re.search(r"^configsfrs_[A-Z0-9]{8} 0x.*$", lineItem)):
+            if (_re_config_4.search(lineItem)):
                 continue
 
             cleanFile.write(lineItem)
@@ -430,19 +457,27 @@ def main(projectPath):
     # delete already geenrated files
     cleanupOutput(cleanFileName, distClean=True)
 
+    start = time.time() 
     # remove debug symbols from the map file
     cleanupMapFile(mapFilePath)
+    print(f'Cleaning Map File: {time.time() - start}s')
 
+    start = time.time()
     # parse the file and get component files
     parseMap(cleanFileName)
+    print(f'Parsing Map File: {time.time() - start}s')
 
     # now read the parsed file and translate addresses to line. Some might fail
     print("running addr2Line")
+    start = time.time()
     attachFileNames(cleanFileName)
+    print(f'Attaching Filenames: {time.time() - start}s')
 
     # Get file names of remaining from _ext and assign modules in CSV file
     print("parsing DWARF")
+    start = time.time()
     finalizeFileNames(mapFilePath)
+    print(f'Finalize Filenames: {time.time() - start}s')
 
     # compute sizeDict per file
     filewiseSize(mapFilePath)
